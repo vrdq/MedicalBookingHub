@@ -8,7 +8,7 @@ Full-stack medical appointment scheduling and telemedicine platform built with R
 - **Backend (`MedicalBookingBackend`)**: RESTful API server powered by Express 5 and Node.js. Uses Drizzle ORM for type-safe database queries against PostgreSQL, bundled with Esbuild for minimal cold-start overhead.
 - **Role-Based Access Control (RBAC)**: Distinct authorization boundaries and dedicated workflows for Patients, Healthcare Providers (Doctors/Therapists), and System Administrators.
 - **Slot Scheduling Engine**: Configurable doctor availability and instant session routing with atomic transaction locks to eliminate race conditions and double-booking.
-- **Consultation & Messaging**: Secure consultation channel with base64/multipart medical receipt and document uploads (2MB sanitized payload limit).
+- **Consultation and Messaging**: Secure consultation channel with base64/multipart medical receipt and document uploads (2MB sanitized payload limit).
 - **Transactional Email Subsystem**: Dynamic multi-provider email dispatcher supporting Resend, Brevo API, and direct SMTP transport for verification tokens and 6-digit password reset codes.
 - **Localization**: Native bilingual interface (English and Arabic) with automatic RTL (Right-to-Left) layout transitions and localized medical taxonomy.
 
@@ -16,7 +16,7 @@ Full-stack medical appointment scheduling and telemedicine platform built with R
 
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI, TanStack Query, Framer Motion, Lucide Icons, Wouter
 - **Backend**: Node.js, Express 5, TypeScript, Drizzle ORM, PostgreSQL (`postgres.js`), Zod, Esbuild, Pino
-- **Security & Auth**: JWT (JSON Web Tokens), bcryptjs password hashing, Helmet HTTP security headers, CORS origin enforcement, Multer file upload filtering
+- **Security and Auth**: JWT (JSON Web Tokens), bcryptjs password hashing, Helmet HTTP security headers, CORS origin enforcement, Multer file upload filtering
 - **Integrations**: Resend API, Brevo API, SMTP
 
 ## Repository Structure
