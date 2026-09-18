@@ -1,0 +1,710 @@
+// @ts-nocheck
+import { Router } from "express";
+import { db } from "../../db/src/index.js";
+import { appointmentsTable, doctorsTable, slotsTable, usersTable, messagesTable } from "../../db/src/index.js";
+import { eq, and, or, asc, sql, inArray, aliasedTable, isNull } from "drizzle-orm";
+import { requireAuth, requireRole, type AuthRequest } from "../middlewares/requireAuth.js";
+import {
+  CreateAppointmentBody,
+  MarkAppointmentPaidParams,
+  UpdateAppointmentStatusParams,
+  UpdateAppointmentStatusBody,
+  GetAppointmentParams,
+} from "../../zod/src/index.js";
+
+const router: any = Router();
+const dUsers = aliasedTable(usersTable, "d_users");
+
+
+// Helper to safely format appointment data with full doctor/patient/slot context
+function formatAppointmentRow(row: any) {
+  const appt = row.appointment;
+  const patient = row.patient;
+  const doctorUser = row.doctorUser;
+  const doctor = row.doctor;
+  const slot = row.slot;
+
+  try {
+    // Safely determine start/end times
+    const start = slot?.startTime instanceof Date 
+      ? slot.startTime 
+      : (slot?.startTime ? new Date(slot.startTime) : (appt.createdAt instanceof Date ? appt.createdAt : new Date(appt.createdAt)));
+    
+    const startTime = start.toISOString();
+    
+    let endTime;
+    if (slot?.endTime) {
+      endTime = slot.endTime instanceof Date ? slot.endTime.toISOString() : new Date(slot.endTime).toISOString();
+    } else {
+      // Default 1 hour duration for instant sessions to ensure they show up on calendars
+      const end = new Date(start.getTime() + 60 * 60 * 1000);
+      endTime = end.toISOString();
+    }
+
+    return {
+      id: appt.id,
+      patientId: appt.patientId,
+      doctorId: appt.doctorId,
+      slotId: appt.slotId ?? null,
+      isInstant: appt.slotId == null,
+      status: appt.status,
+      isPaid: appt.isPaid,
+      paidAt: appt.paidAt instanceof Date ? appt.paidAt.toISOString() : (appt.paidAt ? new Date(appt.paidAt).toISOString() : null),
+      notes: appt.notes,
+      patientRating: appt.patientRating ?? null,
+      patientReview: appt.patientReview ?? null,
+      patientName: patient ? `${patient.firstName} ${patient.lastName}` : "Unknown Patient",
+      patientEmail: patient?.email ?? null,
+      patientPhone: patient?.phone ?? null,
+      doctorName: doctorUser ? `${doctorUser.firstName} ${doctorUser.lastName}` : "Unknown Doctor",
+      doctorSpecialty: doctor?.specialty ?? null,
+      doctorPrice: doctor?.price ?? null,
+      doctorPaymentInfo: doctor?.paymentInfo ?? null,
+      startTime,
+      endTime,
+      createdAt: appt.createdAt instanceof Date ? appt.createdAt.toISOString() : new Date(appt.createdAt).toISOString(),
+      cancelledBy: appt.cancelledBy,
+      cancelledAt: appt.cancelledAt instanceof Date ? appt.cancelledAt.toISOString() : (appt.cancelledAt ? new Date(appt.cancelledAt).toISOString() : null),
+      doctorUserId: doctorUser?.id ?? null,
+    };
+  } catch (err) {
+    console.error("[FORMAT_APPT] Formatting error for appt ID:", appt.id, err);
+    return { id: appt.id, error: "Formatting failed" };
+  }
+}
+
+router.get("/appointments", requireAuth, async (req: AuthRequest, res): Promise<void> => {
+  try {
+    const baseQuery = db
+      .select({
+        appointment: appointmentsTable,
+        patient: usersTable,
+        doctor: doctorsTable,
+        doctorUser: dUsers,
+        slot: slotsTable,
+      })
+      .from(appointmentsTable)
+      .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+      .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+      .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+      .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id));
+
+    let rows;
+    if (req.userRole === "patient") {
+      rows = await baseQuery.where(eq(appointmentsTable.patientId, req.userId!));
+    } else if (req.userRole === "doctor") {
+      const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+      if (!doctor) {
+        res.json([]);
+        return;
+      }
+      rows = await baseQuery.where(eq(appointmentsTable.doctorId, doctor.id));
+    } else {
+      res.status(403).json({ error: "Admins should use /api/admin/appointments" });
+      return;
+    }
+
+    const formatted = rows.map(formatAppointmentRow);
+    res.json(formatted);
+  } catch (err) {
+    console.error("[GET_APPOINTMENTS] Error:", err);
+    res.status(500).json({ error: "Failed to fetch appointments" });
+  }
+});
+
+router.post("/appointments", requireAuth, requireRole("patient"), async (req: AuthRequest, res): Promise<void> => {
+  // Fix for instant sessions where slotId is sent as null
+  if (req.body && req.body.slotId === null) {
+    req.body.slotId = undefined;
+  }
+
+  const parsed = CreateAppointmentBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { slotId, doctorId, notes } = parsed.data;
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      const [doctor] = await tx.select().from(doctorsTable).where(eq(doctorsTable.id, doctorId)).for("update");
+      if (!doctor) {
+        throw { status: 400, message: "Doctor not found" };
+      }
+
+      // Instant booking — no slotId provided
+      if (slotId == null) {
+        if (!doctor.isOnline) {
+          throw { status: 400, message: "Doctor is not available for instant sessions right now" };
+        }
+
+        // CHECK IF DOCTOR IS ALREADY IN AN ACTIVE INSTANT SESSION
+        const [activeInstant] = await tx
+          .select()
+          .from(appointmentsTable)
+          .where(and(
+            eq(appointmentsTable.doctorId, doctorId),
+            isNull(appointmentsTable.slotId),
+            or(eq(appointmentsTable.status, "pending"), eq(appointmentsTable.status, "confirmed"))
+          ))
+          .limit(1);
+
+        if (activeInstant) {
+          throw { status: 400, message: "Doctor is currently busy with another instant session. Please try again in a few minutes." };
+        }
+
+        const [appointment] = await tx.insert(appointmentsTable).values({
+          patientId: req.userId!,
+          doctorId,
+          slotId: null,
+          notes: notes ?? null,
+          status: "confirmed",
+        }).returning();
+
+        // Automated first message
+        await tx.insert(messagesTable).values({
+          appointmentId: appointment.id,
+          senderId: 1,
+          senderName: "System",
+          senderRole: "admin",
+          content: `Thank you for booking an instant session! Please complete your payment via ${doctor.paymentInfo || "InstaPay or your preferred method"} and share the receipt here for verification.`,
+        });
+
+        return appointment;
+      }
+
+      // Slot-based booking
+      const [slot] = await tx.select().from(slotsTable).where(and(eq(slotsTable.id, slotId), eq(slotsTable.doctorId, doctorId))).for("update");
+      if (!slot) {
+        throw { status: 400, message: "Slot not found for this doctor" };
+      }
+      if (slot.isBooked) {
+        throw { status: 400, message: "Slot is already booked" };
+      }
+
+      const [appointment] = await tx.insert(appointmentsTable).values({
+        patientId: req.userId!,
+        doctorId,
+        slotId,
+        notes: notes ?? null,
+        status: "pending",
+      }).returning();
+
+
+
+      // Automated first message
+      await tx.insert(messagesTable).values({
+        appointmentId: appointment.id,
+        senderId: 1,
+        senderName: "System",
+        senderRole: "admin",
+        content: `Thank you for your booking! Please complete your payment via ${doctor.paymentInfo || "InstaPay or your preferred method"} and share the receipt here for verification. Your slot is now reserved.`,
+      });
+
+      return appointment;
+    });
+
+    // Fetch the fully joined appointment data to return to the client
+    const [row] = await db
+      .select({
+        appointment: appointmentsTable,
+        patient: usersTable,
+        doctor: doctorsTable,
+        doctorUser: dUsers,
+        slot: slotsTable,
+      })
+      .from(appointmentsTable)
+      .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+      .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+      .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+      .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+      .where(eq(appointmentsTable.id, result.id));
+
+    res.status(201).json(formatAppointmentRow(row));
+  } catch (err: any) {
+    console.error("[POST_APPOINTMENTS] Error:", err);
+    res.status(err.status || 500).json({ error: err.message || "Failed to create appointment" });
+  }
+});
+
+
+router.get("/appointments/:id", requireAuth, async (req: AuthRequest, res): Promise<void> => {
+  const params = GetAppointmentParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, params.data.id));
+  if (!appt) {
+    res.status(404).json({ error: "Appointment not found" });
+    return;
+  }
+
+  // Ownership Check
+  if (req.userRole === "patient" && appt.patientId !== req.userId) {
+    res.status(403).json({ error: "Access denied: This appointment does not belong to you" });
+    return;
+  }
+  if (req.userRole === "doctor") {
+    const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+    if (!doctor || doctor.id !== appt.doctorId) {
+      res.status(403).json({ error: "Access denied: This appointment is not assigned to you" });
+      return;
+    }
+  }
+
+  const [row] = await db
+    .select({
+      appointment: appointmentsTable,
+      patient: usersTable,
+      doctor: doctorsTable,
+      doctorUser: dUsers,
+      slot: slotsTable,
+    })
+    .from(appointmentsTable)
+    .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+    .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+    .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+    .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+    .where(eq(appointmentsTable.id, appt.id));
+
+  res.json(formatAppointmentRow(row));
+});
+
+router.patch("/appointments/:id/mark-paid", requireAuth, requireRole("doctor", "admin"), async (req: AuthRequest, res): Promise<void> => {
+  const params = MarkAppointmentPaidParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  try {
+    const updated = await db.transaction(async (tx) => {
+      const [appt] = await tx.select().from(appointmentsTable).where(eq(appointmentsTable.id, params.data.id)).for("update");
+      if (!appt) {
+        throw { status: 404, message: "Appointment not found" };
+      }
+
+      if (req.userRole === "doctor") {
+        const [doctor] = await tx.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+        if (!doctor || doctor.id !== appt.doctorId) {
+          throw { status: 403, message: "You can only mark your own appointments as paid" };
+        }
+      }
+
+      if (appt.isPaid) {
+        return appt;
+      }
+
+      if (appt.slotId) {
+        const [slot] = await tx.select().from(slotsTable).where(eq(slotsTable.id, appt.slotId)).for("update");
+        if (!slot) {
+          throw { status: 400, message: "Associated slot not found" };
+        }
+        if (slot.isBooked) {
+          throw { status: 400, message: "This slot is already booked and paid for by another user" };
+        }
+
+        await tx.update(slotsTable).set({ isBooked: true }).where(eq(slotsTable.id, appt.slotId));
+
+        await tx.update(appointmentsTable)
+          .set({ 
+            status: "cancelled", 
+            cancelledBy: 1, 
+            cancelledAt: new Date() 
+          })
+          .where(and(
+            eq(appointmentsTable.slotId, appt.slotId),
+            eq(appointmentsTable.status, "pending"),
+            eq(appointmentsTable.isPaid, false)
+          ));
+      }
+
+      const [updatedRecord] = await tx
+        .update(appointmentsTable)
+        .set({ isPaid: true, paidAt: new Date(), status: "confirmed" })
+        .where(eq(appointmentsTable.id, appt.id))
+        .returning();
+
+      return updatedRecord;
+    });
+
+    const [row] = await db
+      .select({
+        appointment: appointmentsTable,
+        patient: usersTable,
+        doctor: doctorsTable,
+        doctorUser: dUsers,
+        slot: slotsTable,
+      })
+      .from(appointmentsTable)
+      .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+      .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+      .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+      .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+      .where(eq(appointmentsTable.id, updated.id));
+
+    res.json(formatAppointmentRow(row));
+  } catch (err: any) {
+    console.error("[MARK_PAID] Concurrency error:", err);
+    res.status(err.status || 500).json({ error: err.message || "Failed to mark appointment as paid" });
+  }
+});
+
+router.patch("/appointments/:id/mark-unpaid", requireAuth, requireRole("admin"), async (req: AuthRequest, res): Promise<void> => {
+  const params = MarkAppointmentPaidParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, params.data.id));
+  if (!appt) {
+    res.status(404).json({ error: "Appointment not found" });
+    return;
+  }
+
+  const [updated] = await db
+    .update(appointmentsTable)
+    .set({ isPaid: false, paidAt: null })
+    .where(eq(appointmentsTable.id, params.data.id))
+    .returning();
+
+  const [row] = await db
+    .select({
+      appointment: appointmentsTable,
+      patient: usersTable,
+      doctor: doctorsTable,
+      doctorUser: dUsers,
+      slot: slotsTable,
+    })
+    .from(appointmentsTable)
+    .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+    .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+    .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+    .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+    .where(eq(appointmentsTable.id, updated.id));
+
+  res.json(formatAppointmentRow(row));
+});
+
+router.patch("/appointments/:id/status", requireAuth, requireRole("doctor", "admin"), async (req: AuthRequest, res): Promise<void> => {
+  const params = UpdateAppointmentStatusParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const parsed = UpdateAppointmentStatusBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, params.data.id));
+  if (!appt) {
+    res.status(404).json({ error: "Appointment not found" });
+    return;
+  }
+
+  // Ownership Check
+  if (req.userRole === "doctor") {
+    const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+    if (!doctor || doctor.id !== appt.doctorId) {
+      res.status(403).json({ error: "Access denied: You can only update your own appointments" });
+      return;
+    }
+  }
+
+  const updates: Partial<typeof appointmentsTable.$inferInsert> = { status: parsed.data.status };
+  if (parsed.data.status === "cancelled") {
+    updates.cancelledBy = req.userId!;
+    updates.cancelledAt = new Date();
+    if (appt.slotId) {
+      if (appt.status === "confirmed" || appt.isPaid) {
+        await db.update(slotsTable).set({ isBooked: false }).where(eq(slotsTable.id, appt.slotId));
+      }
+    }
+  }
+
+  const [updated] = await db
+    .update(appointmentsTable)
+    .set(updates)
+    .where(eq(appointmentsTable.id, params.data.id))
+    .returning();
+
+  const [row] = await db
+    .select({
+      appointment: appointmentsTable,
+      patient: usersTable,
+      doctor: doctorsTable,
+      doctorUser: dUsers,
+      slot: slotsTable,
+    })
+    .from(appointmentsTable)
+    .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+    .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+    .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+    .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+    .where(eq(appointmentsTable.id, updated.id));
+
+  res.json(formatAppointmentRow(row));
+});
+
+router.patch("/appointments/:id/cancel", requireAuth, async (req: AuthRequest, res): Promise<void> => {
+  const id = parseInt(req.params.id as string, 10);
+  if (isNaN(id)) { res.status(400).json({ error: "Invalid appointment id" }); return; }
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, id));
+  if (!appt) { res.status(404).json({ error: "Appointment not found" }); return; }
+
+  // Check permission
+  if (req.userRole === "patient" && appt.patientId !== req.userId) {
+    res.status(403).json({ error: "Forbidden" }); return;
+  }
+  if (req.userRole === "doctor") {
+    const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+    if (!doctor || doctor.id !== appt.doctorId) { res.status(403).json({ error: "Forbidden" }); return; }
+  }
+
+  if (appt.status === "completed" || appt.status === "cancelled") {
+    res.status(400).json({ error: "Cannot cancel a completed or already cancelled appointment" });
+    return;
+  }
+
+  const [updated] = await db
+    .update(appointmentsTable)
+    .set({ 
+      status: "cancelled", 
+      cancelledBy: req.userId!, 
+      cancelledAt: new Date() 
+    })
+    .where(eq(appointmentsTable.id, id))
+    .returning();
+
+  if (appt.slotId) {
+    if (appt.status === "confirmed" || appt.isPaid) {
+      await db.update(slotsTable).set({ isBooked: false }).where(eq(slotsTable.id, appt.slotId));
+    }
+  }
+
+  const [row] = await db
+    .select({
+      appointment: appointmentsTable,
+      patient: usersTable,
+      doctor: doctorsTable,
+      doctorUser: dUsers,
+      slot: slotsTable,
+    })
+    .from(appointmentsTable)
+    .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+    .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+    .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+    .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+    .where(eq(appointmentsTable.id, updated.id));
+
+  res.json(formatAppointmentRow(row));
+});
+
+router.get("/appointments/:id/messages", requireAuth, async (req: AuthRequest, res): Promise<void> => {
+  const appointmentId = parseInt(req.params.id as string, 10);
+  if (isNaN(appointmentId)) { res.status(400).json({ error: "Invalid appointment id" }); return; }
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, appointmentId));
+  if (!appt) { res.status(404).json({ error: "Appointment not found" }); return; }
+
+  if (req.userRole === "patient" && appt.patientId !== req.userId) {
+    res.status(403).json({ error: "Forbidden" }); return;
+  }
+  if (req.userRole === "doctor") {
+    const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+    if (!doctor || doctor.id !== appt.doctorId) { res.status(403).json({ error: "Forbidden" }); return; }
+  }
+  // Admin is always allowed
+
+  const messages = await db.select().from(messagesTable)
+    .where(eq(messagesTable.appointmentId, appointmentId))
+    .orderBy(asc(messagesTable.createdAt));
+
+  res.json(messages);
+});
+
+router.post("/appointments/:id/messages", requireAuth, async (req: AuthRequest, res): Promise<void> => {
+  const appointmentId = parseInt(req.params.id as string, 10);
+  if (isNaN(appointmentId)) { res.status(400).json({ error: "Invalid appointment id" }); return; }
+
+  const content = (req.body?.content ?? "").trim();
+  if (!content) { res.status(400).json({ error: "Message content is required" }); return; }
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, appointmentId));
+  if (!appt) { res.status(404).json({ error: "Appointment not found" }); return; }
+
+  if (req.userRole === "patient" && appt.patientId !== req.userId) {
+    res.status(403).json({ error: "Forbidden" }); return;
+  }
+  if (req.userRole === "doctor") {
+    const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+    if (!doctor || doctor.id !== appt.doctorId) { res.status(403).json({ error: "Forbidden" }); return; }
+  }
+  // Admin is always allowed
+
+  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.userId!));
+  const [message] = await db.insert(messagesTable).values({
+    appointmentId,
+    senderId: req.userId!,
+    senderName: user ? `${user.firstName} ${user.lastName}` : "Unknown",
+    senderRole: req.userRole!,
+    content,
+    type: req.body?.type ?? "text",
+    fileUrl: req.body?.fileUrl ?? null,
+  }).returning();
+
+  res.status(201).json(message);
+});
+
+router.post("/appointments/:id/rate", requireAuth, requireRole("patient"), async (req: AuthRequest, res): Promise<void> => {
+  const appointmentId = parseInt(req.params.id as string, 10);
+  if (isNaN(appointmentId)) { res.status(400).json({ error: "Invalid appointment id" }); return; }
+
+  const rating = req.body?.rating;
+  if (!rating || typeof rating !== "number" || !Number.isInteger(rating) || rating < 1 || rating > 5) {
+    res.status(400).json({ error: "rating must be an integer between 1 and 5" });
+    return;
+  }
+  const review: string | null = typeof req.body?.review === "string" && req.body.review.trim().length > 0
+    ? req.body.review.trim().slice(0, 1000)
+    : null;
+
+  const [appt] = await db.select().from(appointmentsTable).where(eq(appointmentsTable.id, appointmentId));
+  if (!appt) { res.status(404).json({ error: "Appointment not found" }); return; }
+  if (appt.patientId !== req.userId) { res.status(403).json({ error: "Forbidden" }); return; }
+  if (appt.status !== "completed") { res.status(400).json({ error: "Can only rate completed appointments" }); return; }
+
+  const [updated] = await db
+    .update(appointmentsTable)
+    .set({ patientRating: rating, ...(review !== null && { patientReview: review }) })
+    .where(eq(appointmentsTable.id, appointmentId))
+    .returning();
+
+  const allRatings = await db
+    .select({ patientRating: appointmentsTable.patientRating })
+    .from(appointmentsTable)
+    .where(eq(appointmentsTable.doctorId, appt.doctorId));
+
+  const rated = allRatings.filter(a => a.patientRating != null);
+  if (rated.length > 0) {
+    const avg = Math.round((rated.reduce((s, a) => s + (a.patientRating ?? 0), 0) / rated.length) * 10) / 10;
+    await db
+      .update(doctorsTable)
+      .set({ rating: avg, reviewCount: rated.length })
+      .where(eq(doctorsTable.id, appt.doctorId));
+  }
+
+  const [row] = await db
+    .select({
+      appointment: appointmentsTable,
+      patient: usersTable,
+      doctor: doctorsTable,
+      doctorUser: dUsers,
+      slot: slotsTable,
+    })
+    .from(appointmentsTable)
+    .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+    .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+    .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+    .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+    .where(eq(appointmentsTable.id, updated.id));
+
+  res.json(formatAppointmentRow(row));
+});
+
+router.get("/calendar", requireAuth, requireRole("doctor", "admin"), async (req: AuthRequest, res): Promise<void> => {
+  let appointments: typeof appointmentsTable.$inferSelect[];
+
+  if (req.userRole === "doctor") {
+    const [doctor] = await db.select().from(doctorsTable).where(eq(doctorsTable.userId, req.userId!));
+    if (!doctor) {
+      res.json([]);
+      return;
+    }
+    appointments = await db.select().from(appointmentsTable).where(
+      and(
+        eq(appointmentsTable.doctorId, doctor.id), 
+        or(eq(appointmentsTable.isPaid, true), eq(appointmentsTable.status, "confirmed"))
+      )
+    );
+  } else {
+    appointments = await db.select().from(appointmentsTable).where(
+      or(eq(appointmentsTable.isPaid, true), eq(appointmentsTable.status, "confirmed"))
+    );
+  }
+
+  if (appointments.length === 0) {
+    res.json([]);
+    return;
+  }
+
+  const rows = await db
+    .select({
+      appointment: appointmentsTable,
+      patient: usersTable,
+      doctor: doctorsTable,
+      doctorUser: dUsers,
+      slot: slotsTable,
+    })
+    .from(appointmentsTable)
+    .innerJoin(usersTable, eq(appointmentsTable.patientId, usersTable.id))
+    .innerJoin(doctorsTable, eq(appointmentsTable.doctorId, doctorsTable.id))
+    .innerJoin(dUsers, eq(doctorsTable.userId, dUsers.id))
+    .leftJoin(slotsTable, eq(appointmentsTable.slotId, slotsTable.id))
+    .where(inArray(appointmentsTable.id, appointments.map(a => a.id)));
+
+  const formatted = rows.map(formatAppointmentRow);
+  res.json(formatted);
+});
+
+/** Public — returns all patient reviews for a given doctor (rating + review text + patient first name) */
+router.get("/doctors/:doctorId/reviews", async (req, res): Promise<void> => {
+  const doctorId = parseInt(req.params.doctorId as string, 10);
+  if (isNaN(doctorId)) { res.status(400).json({ error: "Invalid doctor id" }); return; }
+
+  const rows = await db
+    .select({
+      id: appointmentsTable.id,
+      patientRating: appointmentsTable.patientRating,
+      patientReview: appointmentsTable.patientReview,
+      patientId: appointmentsTable.patientId,
+      createdAt: appointmentsTable.createdAt,
+    })
+    .from(appointmentsTable)
+    .where(and(
+      eq(appointmentsTable.doctorId, doctorId), 
+      eq(appointmentsTable.status, "completed"),
+      eq(appointmentsTable.isReviewApproved, true)
+    ));
+
+  const reviews = await Promise.all(
+    rows
+      .filter(r => r.patientRating != null)
+      .map(async r => {
+        const [patient] = await db.select({ firstName: usersTable.firstName }).from(usersTable).where(eq(usersTable.id, r.patientId));
+        const firstName = patient?.firstName ?? "Patient";
+        return {
+          id: r.id,
+          rating: r.patientRating!,
+          review: r.patientReview ?? null,
+          comment: r.patientReview ?? null,
+          patientFirstName: firstName,
+          patientName: firstName,
+          createdAt: r.createdAt.toISOString(),
+        };
+      })
+  );
+
+  reviews.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  res.json(reviews);
+});
+
+export default router;

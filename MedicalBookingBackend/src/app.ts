@@ -1,0 +1,81 @@
+// @ts-nocheck
+import pinoHttp from "pino-http";
+import path from "path";
+import cors from "cors";
+import compression from "compression";
+import helmet from "helmet";
+import express, { Request, Response } from "express";
+import router from "./routes/index.js";
+import { logger } from "./lib/logger.js";
+
+const app: any = express();
+
+// Security & Performance Middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+app.use(compression());
+app.use(cors({
+  origin: "*",
+  credentials: true,
+  methods: ["GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+}));
+// Logging
+app.use(
+  (pinoHttp as any)({
+    logger,
+    serializers: {
+      req(req: any) {
+        return {
+          id: (req as any).id,
+          method: req.method,
+          url: req.url?.split("?")[0],
+        };
+      },
+      res(res: any) {
+        return {
+          statusCode: res.statusCode,
+        };
+      },
+    },
+  }),
+);
+
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use("/uploads", express.static("uploads"));
+
+// Handle both /api and direct routes to be safe on Vercel
+app.use("/", router);
+app.use("/api", router);
+
+// Global Error Handler
+app.use((err: any, req: any, res: any, next: any) => {
+  console.error("[GLOBAL_ERROR]", err);
+  
+  // Handle Multer specific errors
+  if (err.code === "LIMIT_FILE_SIZE") {
+    res.status(413).json({
+      error: "File too large",
+      message: "The uploaded file exceeds the allowed size limit (2MB)."
+    });
+    return;
+  }
+
+  // Handle custom upload/type errors from uploads fileFilter
+  if (err.message && err.message.includes("Only images (jpeg, jpg, png) are allowed")) {
+    res.status(400).json({
+      error: "Invalid file type",
+      message: err.message
+    });
+    return;
+  }
+
+  res.status(500).json({ 
+    error: "Internal Server Error",
+    message: err.message
+  });
+});
+
+export default app;
